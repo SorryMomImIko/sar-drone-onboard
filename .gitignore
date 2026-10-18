@@ -1,0 +1,15 @@
+# сборка
+build/
+*.o
+
+# создаётся на плате во время работы
+finds/
+queue/
+
+# принятое на земле
+finds_received/
+events.jsonl
+dump.bin
+
+__pycache__/
+*.pyc
