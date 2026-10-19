@@ -44,7 +44,11 @@ struct FindingEvent {
 };
 
 struct EmitterConfig {
-    CameraIntrinsics cam;
+    // Угол обзора, а НЕ готовые параметры камеры: фокусное в пикселях
+    // зависит от размера кадра, а размер становится известен только когда
+    // пришёл первый кадр. Зашитый размер здесь означал бы тихую ошибку
+    // геопривязки при любом другом разрешении камеры.
+    double           hfov_deg = 62.0;
     Mat3             R_mount;
     int64_t          mono_to_utc_us = 0;
     std::string      finds_dir = "finds";
@@ -63,12 +67,15 @@ public:
 
         // Телеметрия НА МОМЕНТ СЪЁМКИ ЭТОГО КАДРА, а не на "сейчас": между
         // съёмкой и этой строкой прошло несколько инференсов.
+        // Параметры камеры - по РЕАЛЬНОМУ размеру этого кадра.
+        const auto cam = CameraIntrinsics::from_fov(cfg_.hfov_deg,
+                                                    frame.img.cols, frame.img.rows);
         Pose pose{};
         GeoPoint geo{};
         bool geo_valid = false;
         if (tel_.pose_at_frame(frame.t_us, pose)) {
             // Луч выше горизонта (дрон сильно накренён) - геопривязки нет.
-            if (auto g = pixel_to_ground(ev.cx, ev.cy, pose, cfg_.cam, cfg_.R_mount)) {
+            if (auto g = pixel_to_ground(ev.cx, ev.cy, pose, cam, cfg_.R_mount)) {
                 geo = *g;
                 geo_valid = true;
             }

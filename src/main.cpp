@@ -28,7 +28,6 @@ static const std::string CAMERA_PIPELINE =
     "! queue max-size-buffers=1 leaky=downstream "
     "! appsink name=sink";
 
-static const int FRAME_W = 1280, FRAME_H = 720;
 
 // --- Детектор -----------------------------------------------------------------
 static const std::string MODEL_PATH = "best_i8_split.rknn";
@@ -213,7 +212,7 @@ int main(int argc, char** argv) {
         - int64_t(sar::now_us());
 
     sar::EmitterConfig ecfg;
-    ecfg.cam     = sar::CameraIntrinsics::from_fov(CAMERA_HFOV_DEG, FRAME_W, FRAME_H);
+    ecfg.hfov_deg = CAMERA_HFOV_DEG;   // параметры считаются от реального кадра
     ecfg.R_mount = sar::R_body_from_cam(CAMERA_TILT_DEG, CAMERA_PAN_DEG);
     ecfg.mono_to_utc_us = mono_to_utc_us;
     ecfg.finds_dir  = FINDS_DIR;
