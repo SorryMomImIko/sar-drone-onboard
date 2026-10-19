@@ -48,7 +48,9 @@ static const int ARUCO_CONFIRM_FRAMES = 2;
 
 // --- ArUco --------------------------------------------------------------------
 // Словарь тот же, что в model_detection/aruco - DICT_4X4_50.
-static const bool ARUCO_ENABLED = true;
+// SAR_ARUCO=0 выключает поиск маркеров без пересборки
+static const bool ARUCO_ENABLED =
+    !(std::getenv("SAR_ARUCO") && std::string(std::getenv("SAR_ARUCO")) == "0");
 // Повторно слать тот же маркер не чаще, чем раз в столько секунд: маркер
 // лежит на месте и попадает в кадр десятками кадров подряд.
 static const int  ARUCO_REPEAT_S = 15;
