@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <iostream>
 #include <map>
@@ -79,13 +80,18 @@ static const std::string FC_PROTOCOL = "msp";
 // подключения, поэтому брать путь из /dev/serial/by-id/ - он привязан к
 // серийному номеру устройства:   ls -l /dev/serial/by-id/
 // Пустая строка = работать без полётника (находки уйдут без координат).
-static const std::string FC_URI = "/dev/ttyACM0";
+// Пустое значение = работать без полётника:  SAR_FC_URI= ./sar_yolo_pipeline
+static const std::string FC_URI =
+    std::getenv("SAR_FC_URI") ? std::getenv("SAR_FC_URI") : "/dev/ttyACM0";
 
 // --- Земля --------------------------------------------------------------------
 // Дрон подключается к станции САМ и переподключается после каждого обрыва,
 // поэтому её адрес постоянный, а ground_server.py запущен до взлёта.
 // Доставка с гарантией: находка лежит в QUEUE_DIR, пока земля не подтвердит.
-static const std::string GROUND_STATION_IP   = "192.168.1.100";
+// Адрес наземной станции. Переопределяется переменной окружения, чтобы не
+// пересобирать программу ради смены IP:  SAR_GROUND_IP=192.168.3.72 ./sar_yolo_pipeline
+static const std::string GROUND_STATION_IP   =
+    std::getenv("SAR_GROUND_IP") ? std::getenv("SAR_GROUND_IP") : "192.168.3.72";
 static const uint16_t    GROUND_STATION_PORT = 5700;
 static const std::string QUEUE_DIR           = "queue";
 
