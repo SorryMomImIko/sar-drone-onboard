@@ -70,8 +70,12 @@ inline cv::Mat annotate(const cv::Mat& frame, const Outline& outline,
 
     std::vector<cv::Point> pts;
     pts.reserve(outline.size());
-    for (const auto& p : outline) pts.emplace_back(cv::cvRound(p.x), cv::cvRound(p.y));
-    if (pts.size() >= 3) cv::polylines(vis, pts, true, green, 2);
+    for (const auto& p : outline) pts.emplace_back(cvRound(p.x), cvRound(p.y));
+    // Рисуем линиями, а не polylines: тот в разных версиях OpenCV трактует
+    // один вектор точек по-разному и может упасть в работе, а не при сборке.
+    if (pts.size() >= 3)
+        for (size_t i = 0; i < pts.size(); ++i)
+            cv::line(vis, pts[i], pts[(i + 1) % pts.size()], green, 2);
 
     // Подпись ставим у верхнего левого угла контура.
     cv::Rect box = cv::boundingRect(pts) & full;
@@ -124,7 +128,7 @@ inline std::vector<uint8_t> encode_finding_crop(const cv::Mat& frame,
     cv::Mat vis = annotate(frame, outline, label);
 
     std::vector<cv::Point> pts;
-    for (const auto& q : outline) pts.emplace_back(cv::cvRound(q.x), cv::cvRound(q.y));
+    for (const auto& q : outline) pts.emplace_back(cvRound(q.x), cvRound(q.y));
     const cv::Rect bb = cv::boundingRect(pts);
     const float ccx = bb.x + bb.width / 2.f, ccy = bb.y + bb.height / 2.f;
 
