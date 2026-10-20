@@ -56,7 +56,8 @@
 
 namespace sar {
 
-enum : uint8_t { REC_PING = 0, REC_FRAME = 1, REC_CROP = 2, REC_META = 3 };
+enum : uint8_t { REC_PING = 0, REC_FRAME = 1, REC_CROP = 2, REC_META = 3,
+                 REC_TELEMETRY = 4 };
 
 class ReliableLink {
 public:
@@ -65,6 +66,8 @@ public:
     static constexpr uint32_t RECONNECT_S  = 3;    // пауза между попытками подключения
     static constexpr uint32_t PING_S       = 10;   // проверка связи, когда отправлять нечего
     static constexpr size_t   QUEUE_MAX    = 2000; // записей; дальше предупреждаем и не копим
+    static constexpr uint64_t LIVE_PERIOD_US = 1000000; // как часто слать живую телеметрию
+    static constexpr uint64_t LIVE_STALE_US  = 3000000; // старее этого - не слать вовсе
 
     ReliableLink(std::string ip, uint16_t port, std::string queue_dir)
         : ip_(std::move(ip)), port_(port), dir_(std::move(queue_dir)) {
@@ -128,6 +131,23 @@ public:
     bool enqueue(uint8_t type, uint32_t event_id, const std::string& s) {
         return enqueue(type, event_id,
                        reinterpret_cast<const uint8_t*>(s.data()), s.size());
+    }
+
+    // ЖИВАЯ ТЕЛЕМЕТРИЯ - НЕ через очередь, и это сознательно.
+    //
+    // Находка - ценность, терять её нельзя: отсюда очередь на карте,
+    // подтверждения и переотправка. Телеметрия - ровно наоборот: важно
+    // только ПОСЛЕДНЕЕ значение, позапрошлое положение дрона не нужно
+    // никому. Если гнать её через очередь, при обрыве связи на карте
+    // накопятся тысячи записей со старыми координатами, и они хлынут на
+    // землю пачкой ровно тогда, когда канал нужен для находок.
+    //
+    // Поэтому: храним только последнее значение, шлём раз в секунду и
+    // только при живой связи. Не дошло - забыли.
+    void set_live(std::string json) {
+        std::lock_guard<std::mutex> lk(live_mu_);
+        live_ = std::move(json);
+        live_set_us_ = now_us();
     }
 
     bool   connected() const { return connected_; }
@@ -239,12 +259,11 @@ private:
 
             const auto names = list_queue();
             if (names.empty()) {
-                // Отправлять нечего: проверяем, жива ли связь. Молчащее
-                // соединение может быть мёртвым часами - ядро не скажет.
-                wait_for(PING_S);
-                if (!run_) break;
-                if (!list_queue().empty()) continue;
-                if (!send_ping()) { close_sock(); }
+                // Находок нет - шлём живую телеметрию. Она же служит
+                // проверкой связи: молчащее соединение может быть мёртвым
+                // часами, ядро об этом не скажет.
+                if (!send_live_or_ping()) close_sock();
+                wait_ms(200);
                 continue;
             }
 
@@ -269,6 +288,42 @@ private:
             ::remove(path.c_str());               // подтверждено землёй - можно удалять
             ++delivered_;
         }
+    }
+
+    // Возвращает false только при обрыве связи.
+    bool send_live_or_ping() {
+        const uint64_t now = now_us();
+        if (now - last_live_us_ < LIVE_PERIOD_US) return true;
+
+        std::string payload;
+        {
+            std::lock_guard<std::mutex> lk(live_mu_);
+            if (!live_.empty() && now - live_set_us_ < LIVE_STALE_US) payload = live_;
+        }
+        if (payload.empty()) {
+            // Телеметрии нет (полётник молчит) - раз в PING_S проверяем связь.
+            if (now - last_ping_us_ < uint64_t(PING_S) * 1000000ull) return true;
+            last_ping_us_ = now;
+            return send_ping();
+        }
+        last_live_us_ = now;
+        last_ping_us_ = now;
+
+        const uint32_t seq = next_seq_++;
+        std::vector<uint8_t> rec(HDR + payload.size());
+        std::memcpy(rec.data(), "SARL", 4);
+        rec[4] = 1;
+        rec[5] = REC_TELEMETRY;
+        put32(&rec[6],  seq);
+        put32(&rec[10], 0);                       // номера события у телеметрии нет
+        put32(&rec[14], uint32_t(payload.size()));
+        std::memcpy(rec.data() + HDR, payload.data(), payload.size());
+        return send_all(rec.data(), rec.size()) && wait_ack(seq);
+    }
+
+    void wait_ms(int ms) {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait_for(lk, std::chrono::milliseconds(ms), [this] { return !run_; });
     }
 
     bool send_ping() {
@@ -319,6 +374,12 @@ private:
 
     mutable std::mutex m_;
     std::condition_variable cv_;
+
+    mutable std::mutex live_mu_;
+    std::string live_;
+    uint64_t live_set_us_ = 0;
+    uint64_t last_live_us_ = 0;
+    uint64_t last_ping_us_ = 0;
 };
 
 } // namespace sar

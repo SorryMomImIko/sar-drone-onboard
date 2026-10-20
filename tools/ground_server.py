@@ -29,7 +29,7 @@ from pathlib import Path
 MAGIC = b"SARL"
 ACK_MAGIC = b"SARA"
 HDR = 18
-REC_PING, REC_FRAME, REC_CROP, REC_META = 0, 1, 2, 3
+REC_PING, REC_FRAME, REC_CROP, REC_META, REC_TELEMETRY = 0, 1, 2, 3, 4
 KIND = {REC_FRAME: "frame", REC_CROP: "crop"}
 CLASS_NAMES = {0: "человек", 1: "машина", 2: "задымление"}
 KIND_NAMES = {"person": "человек", "smoke": "задымление", "aruco": "маркер ArUco"}
@@ -95,7 +95,13 @@ def handle(conn, addr, out_dir, lock, seen):
                       f"НЕ подтверждаю, дрон пришлёт заново", flush=True)
                 break
 
-            if typ != REC_PING:
+            # Телеметрия идёт потоком, по ней нет номера события и
+            # защищаться от повторов не нужно - важно последнее значение.
+            if typ == REC_TELEMETRY:
+                with lock:
+                    store_telemetry(payload, out_dir)
+                count += 1
+            elif typ != REC_PING:
                 # Подтверждение могло не дойти до дрона, и он прислал запись
                 # заново. Данные те же, но в журнал её второй раз писать
                 # нельзя - на карте появится вторая метка о том же человеке.
@@ -115,6 +121,42 @@ def handle(conn, addr, out_dir, lock, seen):
     finally:
         conn.close()
         print(f"{who} связь разорвана, принято записей: {count}", flush=True)
+
+
+def store_telemetry(payload, out_dir):
+    """Живая телеметрия: дописываем в журнал и показываем одной строкой."""
+    try:
+        t = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return
+    with (out_dir / "telemetry.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(t, ensure_ascii=False) + "\n")
+
+    # Три разных неисправности выглядят по-разному: порт не открылся,
+    # порт открыт но полётник молчит, полётник отвечает но без GPS.
+    # Для оператора это три разных действия, поэтому и строки разные.
+    if not t.get("fc_open"):
+        print("  телеметрия: ПОЛЁТНИК НЕ ПОДКЛЮЧЁН (порт не открылся)", flush=True)
+        return
+    if not t.get("fc_link"):
+        print(f"  телеметрия: полётник МОЛЧИТ по MSP "
+              f"(ответов всего: {t.get('msp_messages', 0)})", flush=True)
+        return
+
+    if "roll_deg" in t:
+        angles = (f"крен {t['roll_deg']:+.1f}° тангаж {t['pitch_deg']:+.1f}° "
+                  f"курс {t['yaw_deg']:.0f}°")
+    else:
+        angles = "углов нет"
+    alt = f"высота {t['alt_m']:.1f} м" if "alt_m" in t else "высоты нет"
+    mark = "ТЕСТОВАЯ ПОЗА: " if t.get("fake_pose") else ""
+    if t.get("geo_valid"):
+        where = f"{t['lat']:.6f} {t['lon']:.6f}"
+    elif "fix_type" in t:
+        where = f"координат нет (фикс {t['fix_type']}/{t.get('sats', 0)})"
+    else:
+        where = "GPS не отвечает"
+    print(f"  телеметрия: {mark}{where}, {alt}, {angles}", flush=True)
 
 
 def store(typ, event_id, payload, out_dir):

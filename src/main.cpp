@@ -1,7 +1,11 @@
 #include <atomic>
 #include <cstdlib>
 #include <chrono>
+#include <deque>
+#include <cstdio>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <map>
 #include <thread>
 #include <sys/stat.h>
@@ -43,7 +47,19 @@ static const char* CLASS_LABELS[] = {"person", "car", "smoke"};
 // Подряд идущих детекций до подтверждения. Для нейросети пять: одиночные
 // ложные срабатывания отсеиваются. Для ArUco двух достаточно - в коде
 // маркера есть собственная проверка целостности.
-static const int CONFIRM_FRAMES       = 5;
+// ПОДТВЕРЖДЕНИЕ НАХОДКИ - ПО ОКНУ ВРЕМЕНИ, А НЕ ПО КАДРАМ ПОДРЯД.
+// "Подряд" ломается на ровном месте: цель на секунду закрыл куст, детектор
+// моргнул на одном кадре - счётчик обнулился, и человек под деревьями может
+// не подтвердиться никогда, хотя виден в половине кадров. Окно это терпит.
+// Три срабатывания за две секунды - это ~13 кадров при 6.5 fps: одиночный
+// ложняк так не проходит, а настоящая цель набирает их с запасом.
+static const int    CONFIRM_HITS     = 3;
+static const double CONFIRM_WINDOW_S = 2.0;
+// Та же находка не чаще раза в столько секунд. Без этого человек, попавший
+// в кадр на минуту, уехал бы на землю полторы сотни раз: кадр 11 КБ, канал
+// забился бы повторами одного и того же. Трекера здесь нет, поэтому "та же"
+// - это "тот же класс", а не "тот же человек".
+static const double FINDING_REPEAT_S = 5.0;
 static const int ARUCO_CONFIRM_FRAMES = 2;
 
 // --- ArUco --------------------------------------------------------------------
@@ -95,6 +111,18 @@ static const std::string GROUND_STATION_IP   =
     std::getenv("SAR_GROUND_IP") ? std::getenv("SAR_GROUND_IP") : "192.168.3.72";
 static const uint16_t    GROUND_STATION_PORT = 5700;
 static const std::string QUEUE_DIR           = "queue";
+
+// --- ТЕСТОВАЯ ПОЗА (наземные проверки) ----------------------------------------
+// Включается ТОЛЬКО переменной окружения, по умолчанию выключена:
+//     SAR_FAKE_POSE=1 ./sar_yolo_pipeline ...
+//     SAR_FAKE_POSE=60.005388,30.373863,30   - свои широта, долгота, высота
+// Нужна, чтобы проверить цепочку "находка -> координата -> земля" на столе:
+// без фикса GPS и с барометром, не обнулённым взведением, геопривязка не
+// отрабатывает, и проверять нечего.
+// Умолчание - башня Политеха, высота 30 м.
+static const double FAKE_LAT = 60.005388;
+static const double FAKE_LON = 30.373863;
+static const float  FAKE_ALT = 30.0f;
 
 // На землю уходит кадр, уменьшенный до 800 пикселей (~11 КБ, с повторами
 // 33 КБ). Полный кадр пишется на карту платы - для разбора после посадки.
@@ -183,6 +211,19 @@ int main(int argc, char** argv) {
     // (углы и координаты отдельно). См. FcTelemetry.hpp.
     sar::FcTelemetry telemetry;
     bool have_fc = false;
+    // Тестовая поза: разбираем переменную окружения до открытия полётника.
+    bool fake_pose = false;
+    double fake_lat = FAKE_LAT, fake_lon = FAKE_LON;
+    float  fake_alt = FAKE_ALT;
+    if (const char* fp = std::getenv("SAR_FAKE_POSE")) {
+        if (std::string(fp) != "0" && *fp) {
+            fake_pose = true;
+            double a = 0, b = 0, c = 0;
+            if (std::sscanf(fp, "%lf,%lf,%lf", &a, &b, &c) == 3) {
+                fake_lat = a; fake_lon = b; fake_alt = float(c);
+            }
+        }
+    }
     if (FC_URI.empty()) {
         std::cout << "полётник: отключён настройкой, координат не будет\n";
     } else if (telemetry.open(FC_PROTOCOL, FC_URI)) {
@@ -195,6 +236,14 @@ int main(int argc, char** argv) {
         std::cerr << "полётник: НЕ УДАЛОСЬ открыть " << FC_URI << " по протоколу "
                   << FC_PROTOCOL << " - геопривязки не будет (проверь имя порта, "
                      "права: группа dialout, и что протокол реализован)\n";
+    }
+
+    if (fake_pose) {
+        telemetry.set_fake_position(fake_lat, fake_lon, fake_alt);
+        std::cerr << "\n*** ТЕСТОВАЯ ПОЗА: координаты подставные - "
+                  << fake_lat << ", " << fake_lon << ", высота " << fake_alt
+                  << " м ***\n*** В ПОЛЁТ С ЭТИМ НЕ ВЫПУСКАТЬ: метки находок"
+                     " будут указывать не туда ***\n\n";
     }
 
     // Канал на землю: своя очередь, свой поток, подтверждения от земли.
@@ -247,7 +296,66 @@ int main(int argc, char** argv) {
     if (ARUCO_ENABLED)
         aruco_thread = std::thread(aruco_loop, std::ref(aruco_slot), std::ref(emitter));
 
-    int consecutive_hits[NUM_CLASSES]{};
+    // Живая телеметрия на землю: раз в секунду, мимо очереди находок.
+    // Нужна, чтобы оператор видел, где дрон, всё время, а не только в
+    // моменты находок. Потеря отдельной посылки не важна - значение
+    // через секунду всё равно сменится.
+    std::thread live_thread([&] {
+        // Посылка уходит ВСЕГДА, даже когда полётника нет или он молчит.
+        // Иначе оператор видит одно и то же пустое место в трёх разных
+        // случаях - дрон не на связи, полётник не подключён, GPS без фикса -
+        // а это три разных решения на земле. Поля, которых нет, просто
+        // отсутствуют в JSON; земля это разбирает.
+        while (g_running) {
+            std::ostringstream js;
+            js << "{\"kind\":\"telemetry\""
+               << ",\"timestamp_us\":"
+               << uint64_t(int64_t(sar::now_us()) + mono_to_utc_us)
+               << ",\"fc_open\":" << (have_fc ? "true" : "false");
+
+            bool geo_ok = false;
+            if (have_fc) {
+                const auto s = telemetry.live_state();
+                js << ",\"fc_link\":" << (s.fc_link ? "true" : "false")
+                   << ",\"msp_messages\":" << s.messages;
+
+                if (s.have_att)
+                    js << std::setprecision(4)
+                       << ",\"roll_deg\":"  << s.roll  * 57.29578
+                       << ",\"pitch_deg\":" << s.pitch * 57.29578
+                       << ",\"yaw_deg\":"   << s.yaw   * 57.29578;
+
+                // Высота - СНАРУЖИ блока координат: в MSP она приходит своим
+                // ответом и есть даже без GPS. Внутри блока она пропадала бы
+                // ровно тогда, когда полезнее всего - на столе и при потере
+                // фикса в воздухе.
+                if (s.have_alt)
+                    js << std::setprecision(4) << ",\"alt_m\":" << s.alt_m;
+
+                if (s.fake) js << ",\"fake_pose\":true";
+
+                if (s.have_pos) {
+                    js << ",\"fix_type\":" << int(s.fix_type)
+                       << ",\"sats\":" << int(s.sats);
+                    // Координату отдаём только когда ей можно верить: точка
+                    // с фиксом 0 - это нули посреди Атлантики, и на карте
+                    // она хуже, чем отсутствие точки.
+                    geo_ok = s.fix_type >= 3 && s.sats >= 6;
+                    if (geo_ok)
+                        js << std::setprecision(9)
+                           << ",\"lat\":" << s.lat << ",\"lon\":" << s.lon;
+                }
+            }
+            js << ",\"geo_valid\":" << (geo_ok ? "true" : "false") << "}";
+            link.set_live(js.str());
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    });
+
+    // Времена срабатываний по каждому классу - скользящее окно.
+    std::deque<uint64_t> hit_times[NUM_CLASSES];
+    uint64_t last_emit_us[NUM_CLASSES]{};
     int frames = 0;
     double infer_total = 0.0;
     auto t_start = std::chrono::steady_clock::now();
@@ -294,12 +402,21 @@ int main(int argc, char** argv) {
         }
 
         for (const int cls : TARGET_CLASS_IDS) {
-            // CONFIRM_FRAMES подряд - фильтр одиночных ложняков. Это НЕ трекер:
-            // если целей в кадре несколько и они не связаны между кадрами,
-            // поверх этого места нужен ByteTrack или SORT.
-            consecutive_hits[cls] = found[cls] ? consecutive_hits[cls] + 1 : 0;
-            if (consecutive_hits[cls] != CONFIRM_FRAMES) continue;
-            consecutive_hits[cls] = 0;
+            // CONFIRM_HITS срабатываний за CONFIRM_WINDOW_S - фильтр
+            // одиночных ложняков. Это НЕ трекер: если целей в кадре несколько
+            // и они не связаны между кадрами, поверх нужен ByteTrack или SORT.
+            const uint64_t now = sar::now_us();
+            auto& hits = hit_times[cls];
+            if (found[cls]) hits.push_back(now);
+            // Выбрасываем всё, что вышло за окно.
+            const uint64_t window_us = uint64_t(CONFIRM_WINDOW_S * 1e6);
+            while (!hits.empty() && now - hits.front() > window_us) hits.pop_front();
+
+            if (int(hits.size()) < CONFIRM_HITS) continue;
+            if (last_emit_us[cls] &&
+                now - last_emit_us[cls] < uint64_t(FINDING_REPEAT_S * 1e6)) continue;
+            last_emit_us[cls] = now;
+            hits.clear();
 
             const Detection& d = best[cls];
             sar::FindingEvent ev;
@@ -318,6 +435,7 @@ int main(int argc, char** argv) {
     aruco_slot.stop();
     capture_thread.join();
     if (aruco_thread.joinable()) aruco_thread.join();
+    if (live_thread.joinable()) live_thread.join();
     telemetry.stop();
     // Канал останавливаем последним: неотправленное останется в QUEUE_DIR
     // и уйдёт при следующем запуске.

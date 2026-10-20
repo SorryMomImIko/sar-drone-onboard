@@ -99,6 +99,13 @@ public:
     uint64_t messages() const override { return n_msgs_.load(); }
     const char* name() const override { return "MSP (Betaflight)"; }
 
+    // Высота приходит своим ответом и не зависит от GPS - отдаём как есть.
+    bool baro_alt_m(float& out) const override {
+        if (!have_alt_.load()) return false;
+        out = alt_rel_m_.load();
+        return true;
+    }
+
 private:
     // ---------------- порт ----------------
 
@@ -235,7 +242,7 @@ private:
         s.lon     = i32(p + 6) / 1e7;
         // Высота ТОЛЬКО из MSP_ALTITUDE. Поле высоты в этом сообщении
         // огрублено до метров и обрезано снизу нулём - не используем.
-        s.alt_rel = have_alt_ ? alt_rel_m_ : NAN;
+        s.alt_rel = have_alt_.load() ? alt_rel_m_.load() : NAN;
         s.alt_msl = NAN;
         s.alt_agl = NAN;                 // дальномера в Betaflight нет
         // Фикс в Betaflight двоичный. Приводим к шкале MAVLink, чтобы
@@ -340,8 +347,9 @@ private:
     std::atomic<uint64_t> last_ok_us_{0};
     std::atomic<uint64_t> n_msgs_{0};
 
-    float alt_rel_m_ = NAN;
-    bool  have_alt_ = false;
+    // Атомарные: пишет поток опроса, читает поток живой телеметрии.
+    std::atomic<float> alt_rel_m_{NAN};
+    std::atomic<bool>  have_alt_{false};
     uint8_t fix_ = 0, sats_ = 0;
 };
 

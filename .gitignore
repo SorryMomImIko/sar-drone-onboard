@@ -13,3 +13,7 @@ dump.bin
 
 __pycache__/
 *.pyc
+
+# принятое наземной станцией с окном
+finds_viewer/
+telemetry.jsonl
